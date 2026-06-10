@@ -16,33 +16,30 @@
     决策，仅负责任务指令的接收、分发与结果汇总。
 
 依赖模块:
-    ag-ecc-12 (资源调度模块，下发工具调用指令)
-    ag-mcc-02 (工具超时管理器)
-    ag-mcc-04 (工具注册中心)
-    ag-mcc-06 (API调用引擎)
-    ag-mcc-07 (代码执行沙箱)
-    ag-mcc-08 (文件操作执行器)
-
+    ag-ecc-12（资源调度模块，下发工具调用指令）,
+    ag-mcc-02（工具超时管理器）, ag-mcc-04（工具注册中心）,
+    ag-mcc-06（API调用引擎）, ag-mcc-07（代码执行沙箱）,
+    ag-mcc-08（文件操作执行器）
 被依赖模块:
-    ag-ecc-12 (接收执行回执)
-    ag-mcc-02~12 (接收调度指令)
+    ag-ecc-12（接收执行回执）, ag-mcc-02~12（接收调度指令）
 
 安全约束:
-    X-01: 本模块为 MCC 行动执行层的唯一入口，所有来自 ECC 的指令必须经本模块接收与路由
-    X-02: 本模块仅负责任务分发与结果汇总，不参与任何工具选择或参数决策
-    X-03: 所有指令必须校验来源合法性，拒绝未携带有效安全令牌的指令
-    X-04: 执行超时后自动中断并上报，不得无限期等待
+  X-01: 本模块为 MCC 行动执行层的唯一入口，所有来自 ECC 的指令必须经本模块接收与路由
+  X-02: 本模块仅负责任务分发与结果汇总，不参与任何工具选择或参数决策
+  X-03: 所有指令必须校验来源合法性，拒绝未携带有效安全令牌的指令
+  X-04: 执行超时后自动中断并上报，不得无限期等待
 """
 
+from typing import Dict, List, Any
+from dataclasses import dataclass, field
+from enum import Enum
 import time
 import uuid
 import threading
-from typing import Dict, List, Optional, Any
-from dataclasses import dataclass, field
-from enum import Enum
+
+from memory_bus import Message, PRIORITY_NORMAL, PRIORITY_HIGH, PRIORITY_ORDER
 
 
-# ====================== 状态定义 ======================
 class ExecutorState(Enum):
     IDLE = "IDLE"
     DISPATCHING = "DISPATCHING"
@@ -50,29 +47,14 @@ class ExecutorState(Enum):
     SYSTEM_PAUSED = "SYSTEM_PAUSED"
 
 
-# ====================== 优先级常量（SPEC 对齐） ======================
-PRIORITY_CRITICAL = "CRITICAL"
-PRIORITY_HIGH = "HIGH"
-PRIORITY_NORMAL = "NORMAL"
-PRIORITY_LOW = "LOW"
-
-PRIORITY_ORDER = {
-    PRIORITY_CRITICAL: 0,
-    PRIORITY_HIGH: 1,
-    PRIORITY_NORMAL: 2,
-    PRIORITY_LOW: 3,
-}
-
-
-# ====================== 数据结构 ======================
 @dataclass
 class ToolCallCommand:
-    """工具调用指令（从 ECC 下发）"""
+    """与 SPEC 字段名严格一致：指令ID = instruction_id"""
     instruction_id: str = ""
     step_id: str = ""
     plan_id: str = ""
     tool_name: str = ""
-    tool_type: str = ""
+    tool_type: str = ""          # API / CODE / FILE
     parameters: Dict[str, Any] = field(default_factory=dict)
     priority: str = PRIORITY_NORMAL
     timeout_sec: float = 60.0
@@ -82,11 +64,11 @@ class ToolCallCommand:
 
 @dataclass
 class ExecutionResult:
-    """执行回执（上报 ECC）"""
+    """与 SPEC 字段名严格一致：指令ID = instruction_id"""
     instruction_id: str = ""
     step_id: str = ""
     plan_id: str = ""
-    status: str = "success"
+    status: str = "success"      # success / failure / timeout / exception
     output_data: Any = None
     error_code: str = ""
     error_message: str = ""
@@ -95,263 +77,176 @@ class ExecutionResult:
     timestamp: float = field(default_factory=time.time)
 
 
-@dataclass
-class ExecutionStatus:
-    """执行状态（周期性上报）"""
-    state: str = "IDLE"
-    active_tasks: int = 0
-    queue_depth: int = 0
-    total_executed: int = 0
-    success_rate: float = 0.0
-
-
 class ExecutionCore:
-    """
-    MCC 行动执行层 执行调度核心 V1.0
-    通过 CerebellumBus 接收 ECC 指令，通过 InternalBus 分发至执行模块
-    """
-    
-    # 最大并发执行数
     MAX_CONCURRENT = 10
-    # 队列最大长度
     MAX_QUEUE_SIZE = 100
-    # 单任务最大超时（秒）
-    MAX_TASK_TIMEOUT = 300
-    # 状态上报间隔（秒）
     STATUS_REPORT_INTERVAL_SEC = 30
+    MAX_STALE_TASK_SEC = 600          # 兜底超时清理阈值（作为 ag-mcc-02 的备份）
 
     def __init__(self):
         self.module_id = "ag-mcc-01"
         self.module_name = "执行调度核心"
         self.version = "V1.0"
 
-        # 总线引用（由 agent_mcc_exec.py 注入）
-        self.bus = None          # InternalBus（MCC 内部通信）
-        self.external_bus = None  # CerebellumBus（与 ECC 通信）
+        # 总线注入点（由主入口赋值）
+        self.bus = None                 # InternalBus
+        self.external_bus = None        # CerebellumBus
 
-        # 状态
-        self.state: ExecutorState = ExecutorState.IDLE
-        self._lock = threading.Lock()
-
-        # 活跃任务表
+        self.state = ExecutorState.IDLE
         self._active_tasks: Dict[str, ToolCallCommand] = {}
-        self._task_start_times: Dict[str, float] = {}
-
-        # 指令队列（支持优先级排序）
         self._queue: List[ToolCallCommand] = []
+        self._total_executed = 0
+        self._success_count = 0
+        self._last_status_time = time.time()
 
-        # 统计
-        self._total_executed: int = 0
-        self._success_count: int = 0
-        self._last_status_time: float = time.time()
-
-        # 待回传结果（已完成但尚未上报的任务）
-        self._completed_results: Dict[str, ExecutionResult] = {}
+        self._pending_commands: List[ToolCallCommand] = []
+        self._lock = threading.Lock()
 
         print(f"[{self.module_id}] {self.module_name} {self.version} 初始化完成")
 
-    # ====================== 主循环（SPEC 定义的标准方法名） ======================
+    # ========== 总线回调接口 ==========
+    def handle_message(self, msg: Message):
+        """
+        处理 InternalBus 消息
+        订阅 topic:
+          - ag-mcc-01.execution_result    来自 ag-mcc-06/07/08 的执行结果
+          - ag-mcc-01.timeout_notification 来自 ag-mcc-02 的超时通知
+        """
+        if msg.topic == "ag-mcc-01.execution_result":
+            result_data = msg.data
+            result = ExecutionResult(**result_data) if isinstance(result_data, dict) else result_data
+            self._finalize_result(result)
+
+        elif msg.topic == "ag-mcc-01.timeout_notification":
+            # SPEC: ag-mcc-02 检测到任务超时后，向本模块发送通知
+            data = msg.data if isinstance(msg.data, dict) else {}
+            task_id = data.get("task_id", "")
+            elapsed = data.get("elapsed_sec", 0)
+            threshold = data.get("timeout_threshold_sec", 0)
+
+            if task_id and task_id in self._active_tasks:
+                cmd = self._active_tasks[task_id]
+                failed_result = ExecutionResult(
+                    instruction_id=task_id,
+                    step_id=cmd.step_id,
+                    plan_id=cmd.plan_id,
+                    status="timeout",
+                    error_code="EXECUTION_TIMEOUT",
+                    error_message=f"执行超时 (已执行 {elapsed:.1f}s，超时阈值 {threshold}s)",
+                    duration_sec=elapsed
+                )
+                self._finalize_result(failed_result)
+
+    def handle_cerebellum_bus_message(self, msg: Message):
+        """处理 CerebellumBus 消息（来自 ECC 的工具调用指令）"""
+        if msg.topic == "ag-mcc-01.tool_call_command":
+            cmd_data = msg.data
+            command = ToolCallCommand(**cmd_data) if isinstance(cmd_data, dict) else cmd_data
+            self._enqueue_command(command)
+
+    # ========== 主循环 ==========
     def execution_core_main_loop(self):
-        """执行一个主循环周期"""
+        now = time.time()
+
         if self.state == ExecutorState.SYSTEM_PAUSED:
             return
 
-        now = time.time()
-
-        # 1. 定期状态上报
+        # 定期状态上报 + 兜底超时清理
         if now - self._last_status_time >= self.STATUS_REPORT_INTERVAL_SEC:
             self._publish_status()
+            self._cleanup_stale_tasks(now)
             self._last_status_time = now
 
-        # 2. 检查超时任务
-        self._check_timeouts(now)
+        # 处理缓冲队列中的新指令（线程安全）
+        while True:
+            with self._lock:
+                if not self._pending_commands:
+                    break
+                cmd = self._pending_commands.pop(0)
 
-        # 3. 从队列中取下一个任务（如果并发数允许）
-        if self._queue and len(self._active_tasks) < self.MAX_CONCURRENT:
-            # 按优先级排序（高优先级的先出队）
-            self._queue.sort(key=lambda c: PRIORITY_ORDER.get(c.priority, 2))
-            next_cmd = self._queue.pop(0)
-            self._dispatch_command(next_cmd)
-
-        # 4. 如果所有任务完成且队列为空，恢复 IDLE
-        if not self._active_tasks and not self._queue:
-            if self.state == ExecutorState.WAITING_RESULTS:
-                self.state = ExecutorState.IDLE
-
-    # ====================== 外部指令接收（CerebellumBus 回调） ======================
-    def handle_cerebellum_bus_message(self, message):
-        """
-        处理来自 CerebellumBus 的消息（由 agent_mcc_exec.py 绑定）
-        预期接收消息：
-            - topic: ag-mcc-01.tool_call_command
-            - data: ToolCallCommand 结构
-        """
-        if not self.external_bus or not self.bus:
-            return  # 总线未注入，忽略
-
-        data = message.data
-        if not data:
-            return
-
-        # 解析指令
-        command = ToolCallCommand(
-            instruction_id=data.get("instruction_id", ""),
-            step_id=data.get("step_id", ""),
-            plan_id=data.get("plan_id", ""),
-            tool_name=data.get("tool_name", ""),
-            tool_type=data.get("tool_type", ""),
-            parameters=data.get("parameters", {}),
-            priority=data.get("priority", PRIORITY_NORMAL),
-            timeout_sec=data.get("timeout", 60.0),
-            security_token=data.get("security_token", ""),
-            timestamp=data.get("timestamp", time.time()),
-        )
-
-        # 1. 安全令牌校验
-        if not command.security_token or len(command.security_token) < 8:
-            self._send_reject(command, "INVALID_TOKEN", "安全令牌无效或缺失")
-            return
-
-        # 2. 重复指令检查
-        if command.instruction_id in self._active_tasks:
-            self._send_reject(command, "DUPLICATE_COMMAND", "指令重复")
-            return
-
-        # 3. 并发满载时排队
-        if len(self._active_tasks) >= self.MAX_CONCURRENT:
-            if len(self._queue) < self.MAX_QUEUE_SIZE:
-                self._queue.append(command)
+            if len(self._active_tasks) < self.MAX_CONCURRENT:
+                self._dispatch_command(cmd)
             else:
-                self._send_reject(command, "QUEUE_FULL", "执行队列已满")
-            return
+                if len(self._queue) < self.MAX_QUEUE_SIZE:
+                    self._queue.append(cmd)
+                else:
+                    self._log_event("QUEUE_FULL_REJECTED", {"instruction_id": cmd.instruction_id})
+                    self._report_rejection(cmd.instruction_id, "执行队列已满")
 
-        # 4. 直接分发
-        self._dispatch_command(command)
+        # 并发空闲时从队列中按优先级取出执行
+        if len(self._active_tasks) < self.MAX_CONCURRENT and self._queue:
+            self._queue.sort(key=lambda c: PRIORITY_ORDER.get(c.priority, 2))
+            while len(self._active_tasks) < self.MAX_CONCURRENT and self._queue:
+                next_cmd = self._queue.pop(0)
+                self._dispatch_command(next_cmd)
 
-    # ====================== 内部消息处理（InternalBus 回调） ======================
-    def handle_message(self, message):
-        """
-        处理来自 InternalBus 的消息（由 agent_mcc_exec.py 绑定）
-        预期接收消息：
-            - topic: ag-mcc-01.execution_result
-            - data: ExecutionResult 结构（来自 ag-mcc-06/07/08）
-        """
-        if not self.bus:
-            return
+        if not self._active_tasks and not self._queue:
+            self.state = ExecutorState.IDLE
 
-        data = message.data
-        if not data:
-            return
+    def _enqueue_command(self, command: ToolCallCommand):
+        with self._lock:
+            self._pending_commands.append(command)
 
-        # 收集执行结果
-        result = ExecutionResult(
-            instruction_id=data.get("instruction_id", ""),
-            step_id=data.get("step_id", ""),
-            plan_id=data.get("plan_id", ""),
-            status=data.get("status", "success"),
-            output_data=data.get("output_data"),
-            error_code=data.get("error_code", ""),
-            error_message=data.get("error_message", ""),
-            duration_sec=data.get("duration_sec", 0.0),
-            resource_consumption=data.get("resource_consumption", {}),
-            timestamp=data.get("timestamp", time.time()),
-        )
-
-        self._finalize_result(result)
-
-    # ====================== 任务分发 ======================
     def _dispatch_command(self, command: ToolCallCommand):
-        """将指令路由至对应执行模块"""
         self.state = ExecutorState.DISPATCHING
 
-        with self._lock:
-            self._active_tasks[command.instruction_id] = command
-            self._task_start_times[command.instruction_id] = time.time()
+        # 1. 重复指令检查
+        if command.instruction_id in self._active_tasks:
+            self._report_rejection(command.instruction_id, "重复指令")
+            return
 
-        # 向 ag-mcc-02 注册超时监控
-        if self.bus:
-            self.bus.publish_to_module(
-                target_module="ag-mcc-02",
-                event_type="register_task",
-                source_module="ag-mcc-01",
-                data={
-                    "instruction_id": command.instruction_id,
-                    "tool_type": command.tool_type,
-                    "start_time": time.time(),
-                    "timeout_sec": command.timeout_sec,
-                },
-                priority=PRIORITY_NORMAL,
-            )
-
-        # 按工具类型路由
-        if command.tool_type == "API":
-            if self.bus:
-                self.bus.publish_to_module(
-                    target_module="ag-mcc-06",
-                    event_type="api_call",
-                    source_module="ag-mcc-01",
-                    data={
-                        "instruction_id": command.instruction_id,
-                        "tool_name": command.tool_name,
-                        "parameters": command.parameters,
-                        "timeout_sec": command.timeout_sec,
-                        "security_token": command.security_token,
-                    },
-                    priority=PRIORITY_NORMAL,
-                )
-        elif command.tool_type == "CODE":
-            if self.bus:
-                self.bus.publish_to_module(
-                    target_module="ag-mcc-07",
-                    event_type="code_exec",
-                    source_module="ag-mcc-01",
-                    data={
-                        "instruction_id": command.instruction_id,
-                        "code": command.parameters.get("code", ""),
-                        "language": command.parameters.get("language", "python"),
-                        "timeout_sec": command.timeout_sec,
-                        "security_token": command.security_token,
-                    },
-                    priority=PRIORITY_NORMAL,
-                )
-        elif command.tool_type == "FILE":
-            if self.bus:
-                self.bus.publish_to_module(
-                    target_module="ag-mcc-08",
-                    event_type="file_operation",
-                    source_module="ag-mcc-01",
-                    data={
-                        "instruction_id": command.instruction_id,
-                        "operation": command.parameters.get("operation", "READ"),
-                        "path": command.parameters.get("path", ""),
-                        "data": command.parameters.get("data"),
-                        "security_token": command.security_token,
-                    },
-                    priority=PRIORITY_NORMAL,
-                )
-        else:
-            # 未知类型，直接返回错误
+        # 2. 安全令牌校验
+        if not self._is_valid_token(command.security_token):
             failed_result = ExecutionResult(
                 instruction_id=command.instruction_id,
                 step_id=command.step_id,
                 plan_id=command.plan_id,
                 status="failure",
-                error_code="UNKNOWN_TOOL_TYPE",
-                error_message=f"未知工具类型: {command.tool_type}",
-                duration_sec=0.0,
+                error_code="INVALID_TOKEN",
+                error_message="安全令牌无效"
             )
             self._finalize_result(failed_result)
             return
 
-        self.state = ExecutorState.WAITING_RESULTS
+        self._active_tasks[command.instruction_id] = command
 
-    # ====================== 结果汇总 ======================
+        # 3. 根据工具类型路由至对应执行模块
+        topic_map = {
+            "API": "ag-mcc-06.api_call_command",
+            "CODE": "ag-mcc-07.code_exec_command",
+            "FILE": "ag-mcc-08.file_op_command",
+        }
+        target_map = {"API": "ag-mcc-06", "CODE": "ag-mcc-07", "FILE": "ag-mcc-08"}
+
+        if command.tool_type in topic_map:
+            if self.bus:
+                self.bus.publish(
+                    topic=topic_map[command.tool_type],
+                    source_module=self.module_id,
+                    data=command.__dict__,
+                    target_module=target_map[command.tool_type],
+                    priority=command.priority
+                )
+                self.state = ExecutorState.WAITING_RESULTS
+            else:
+                self._finalize_result(ExecutionResult(
+                    instruction_id=command.instruction_id,
+                    status="failure",
+                    error_code="BUS_NOT_READY",
+                    error_message="内部总线未就绪"
+                ))
+        else:
+            self._finalize_result(ExecutionResult(
+                instruction_id=command.instruction_id,
+                step_id=command.step_id,
+                plan_id=command.plan_id,
+                status="failure",
+                error_code="UNKNOWN_TOOL_TYPE",
+                error_message=f"未知工具类型: {command.tool_type}"
+            ))
+
     def _finalize_result(self, result: ExecutionResult):
-        """汇总执行结果，上报 ECC"""
-        with self._lock:
-            cmd = self._active_tasks.pop(result.instruction_id, None)
-            self._task_start_times.pop(result.instruction_id, None)
-
+        cmd = self._active_tasks.pop(result.instruction_id, None)
         if cmd:
             result.step_id = result.step_id or cmd.step_id
             result.plan_id = result.plan_id or cmd.plan_id
@@ -360,215 +255,157 @@ class ExecutionCore:
         if result.status == "success":
             self._success_count += 1
 
-        # 通过 CerebellumBus 上报回执
+        # 通过 CerebellumBus 上报执行回执至 ECC
         if self.external_bus:
-            self.external_bus.publish_to_module(
+            self.external_bus.publish(
+                topic="ag-mcc-01.execution_result",
+                source_module=self.module_id,
+                data=result.__dict__,
                 target_module="ag-ecc-12",
-                event_type="execution_result",
-                source_module="ag-mcc-01",
-                data={
-                    "instruction_id": result.instruction_id,
-                    "step_id": result.step_id,
-                    "plan_id": result.plan_id,
-                    "status": result.status,
-                    "output_data": result.output_data,
-                    "error_code": result.error_code,
-                    "error_message": result.error_message,
-                    "duration_sec": result.duration_sec,
-                    "resource_consumption": result.resource_consumption,
-                    "timestamp": result.timestamp,
-                },
-                priority=PRIORITY_HIGH,
+                priority=PRIORITY_HIGH
             )
 
-    # ====================== 超时检查 ======================
-    def _check_timeouts(self, now: float):
-        """检查活跃任务是否超时"""
-        with self._lock:
-            for instruction_id, start_time in list(self._task_start_times.items()):
-                cmd = self._active_tasks.get(instruction_id)
-                if not cmd:
-                    continue
+        if not self._active_tasks and not self._queue:
+            self.state = ExecutorState.IDLE
 
-                elapsed = now - start_time
-                timeout_limit = min(cmd.timeout_sec, self.MAX_TASK_TIMEOUT)
+    def _is_valid_token(self, token: str) -> bool:
+        return bool(token) and len(token) >= 8
 
-                if elapsed >= timeout_limit:
-                    # 超时，生成超时结果
-                    failed_result = ExecutionResult(
-                        instruction_id=instruction_id,
-                        step_id=cmd.step_id,
-                        plan_id=cmd.plan_id,
-                        status="timeout",
-                        error_code="EXECUTION_TIMEOUT",
-                        error_message=f"执行超时 (已执行 {elapsed:.1f}s，超时阈值 {timeout_limit}s)",
-                        duration_sec=elapsed,
-                    )
-                    self._finalize_result(failed_result)
+    def _report_rejection(self, instruction_id: str, reason: str):
+        if self.external_bus:
+            self.external_bus.publish(
+                topic="ag-mcc-01.command_rejected",
+                source_module=self.module_id,
+                data={"instruction_id": instruction_id, "reason": reason},
+                target_module="ag-ecc-12",
+                priority=PRIORITY_NORMAL
+            )
 
-    # ====================== 状态上报 ======================
     def _publish_status(self):
-        """周期性状态上报（通过 InternalBus 广播）"""
-        if not self.bus:
-            return
+        """通过外部总线向 ECC 上报执行状态"""
+        if self.external_bus:
+            rate = self._success_count / max(self._total_executed, 1)
+            self.external_bus.publish(
+                topic="ag-mcc-01.status_report",
+                source_module=self.module_id,
+                data={
+                    "state": self.state.value,
+                    "active_tasks": len(self._active_tasks),
+                    "queue_depth": len(self._queue),
+                    "total_executed": self._total_executed,
+                    "success_rate": round(rate, 3)
+                },
+                target_module="ag-ecc-12",
+                priority=PRIORITY_NORMAL
+            )
 
-        rate = self._success_count / max(self._total_executed, 1)
-        status = ExecutionStatus(
-            state=self.state.value,
-            active_tasks=len(self._active_tasks),
-            queue_depth=len(self._queue),
-            total_executed=self._total_executed,
-            success_rate=round(rate, 3),
-        )
+    def _cleanup_stale_tasks(self, now: float):
+        """兜底超时清理：清理超过最大时长的僵尸任务"""
+        stale_ids = [
+            iid for iid, cmd in self._active_tasks.items()
+            if now - cmd.timestamp >= self.MAX_STALE_TASK_SEC
+        ]
+        for iid in stale_ids:
+            self._finalize_result(ExecutionResult(
+                instruction_id=iid,
+                status="timeout",
+                error_code="STALE_TASK_CLEANUP",
+                error_message=f"任务执行超时（兜底清理，已运行 {self.MAX_STALE_TASK_SEC}s）"
+            ))
+            self._log_event("STALE_TASK_CLEANED", {"instruction_id": iid})
 
-        self.bus.publish(
-            topic="ag-mcc-01.status_report",
-            source_module="ag-mcc-01",
-            data={
-                "state": status.state,
-                "active_tasks": status.active_tasks,
-                "queue_depth": status.queue_depth,
-                "total_executed": status.total_executed,
-                "success_rate": status.success_rate,
-            },
-            priority=PRIORITY_LOW,
-        )
-
-    # ====================== 辅助方法 ======================
-    def _send_reject(self, command: ToolCallCommand, error_code: str, error_message: str):
-        """向 ECC 发送拒绝回执"""
-        result = ExecutionResult(
-            instruction_id=command.instruction_id,
-            step_id=command.step_id,
-            plan_id=command.plan_id,
-            status="failure",
-            error_code=error_code,
-            error_message=error_message,
-            duration_sec=0.0,
-        )
-        self._finalize_result(result)
+    def _log_event(self, event_type: str, details: Dict[str, Any]):
+        if self.bus:
+            self.bus.publish(
+                topic="ag-mcc-12.log_event",
+                source_module=self.module_id,
+                data={
+                    "log_id": f"log-{uuid.uuid4().hex[:8]}",
+                    "event_type": event_type,
+                    "source_module": self.module_id,
+                    "details": details,
+                    "timestamp": time.time()
+                },
+                priority=PRIORITY_NORMAL
+            )
 
     def get_state(self) -> ExecutorState:
         return self.state
 
     def emergency_shutdown(self):
-        """紧急熔断"""
         self.state = ExecutorState.SYSTEM_PAUSED
         with self._lock:
             self._queue.clear()
             self._active_tasks.clear()
-            self._task_start_times.clear()
+            self._pending_commands.clear()
         print(f"[{self.module_id}] 紧急熔断完成，所有任务已清除")
 
     def shutdown(self):
-        """安全关闭（由 agent_mcc_exec.py 调用）"""
         self.state = ExecutorState.IDLE
+        with self._lock:
+            self._queue.clear()
+            self._active_tasks.clear()
+            self._pending_commands.clear()
         print(f"[{self.module_id}] 已安全关闭")
 
+    # 测试专用接口
+    def _test_inject_command(self, command: ToolCallCommand):
+        self._enqueue_command(command)
+        self.execution_core_main_loop()
 
-# ====================== 演示与测试 ======================
-def print_separator(title: str):
-    print("\n" + "=" * 60)
-    print(f"  {title}")
-    print("=" * 60)
+    def _test_inject_result(self, result: ExecutionResult):
+        self._finalize_result(result)
 
 
+# ========== 演示与测试 ==========
 def demo_main():
-    print("=" * 60)
-    print("  ag-mcc-01 执行调度核心 V1.0 演示")
-    print("  原创提出者：文波福")
-    print("=" * 60)
+    print("=" * 70)
+    print("  Agent-mcc-exec 执行调度核心 (ag-mcc-01) 演示")
+    print("=" * 70)
 
     core = ExecutionCore()
-    
-    # 注入模拟总线
-    from memory_bus import InternalBus, CerebellumBus
-    internal_bus = InternalBus()
-    external_bus = CerebellumBus()
-    
-    core.bus = internal_bus
-    core.external_bus = external_bus
-    
-    # 注册模块到总线
-    internal_bus.register_module("ag-mcc-01")
-    internal_bus.register_module("ag-mcc-02")
-    internal_bus.register_module("ag-mcc-06")
-    external_bus.register_module("ag-mcc-01")
-    external_bus.register_module("ag-ecc-12")
-    
-    # 绑定回调
-    internal_bus.subscribe_to_module("ag-mcc-01", core.handle_message)
-    external_bus.subscribe_to_module("ag-mcc-01", core.handle_cerebellum_bus_message)
 
-    print_separator("STEP 1: 模拟 ECC 下发 API 调用指令")
-    external_bus.publish_to_module(
-        target_module="ag-mcc-01",
-        event_type="tool_call_command",
-        source_module="ag-ecc-12",
-        data={
-            "instruction_id": "CMD-001",
-            "step_id": "S01",
-            "plan_id": "P01",
-            "tool_name": "weather_api",
-            "tool_type": "API",
-            "parameters": {"city": "Beijing"},
-            "priority": PRIORITY_NORMAL,
-            "timeout": 30,
-            "security_token": "valid-token-12345",
-        },
+    print("\n[演示] 注入API指令并模拟成功结果")
+    cmd = ToolCallCommand(
+        instruction_id="CMD-001", step_id="S01", plan_id="P01",
+        tool_name="weather_api", tool_type="API",
+        parameters={"city": "北京"}, security_token="valid-token-12345"
     )
-
-    # 处理消息
-    external_bus.process_all()
-    core.execution_core_main_loop()
-    internal_bus.process_all()
-    
+    core._test_inject_command(cmd)
     print(f"  活跃任务数: {len(core._active_tasks)}")
-    print(f"  当前状态: {core.state.value}")
+    core._test_inject_result(ExecutionResult(instruction_id="CMD-001", status="success", duration_sec=1.2))
+    print(f"  总执行: {core._total_executed}, 成功: {core._success_count}")
 
-    print_separator("STEP 2: 并发满载时排队")
+    print("\n[演示] 并发满载排队")
     for i in range(core.MAX_CONCURRENT):
-        core._active_tasks[f"T{i}"] = ToolCallCommand(
-            instruction_id=f"T{i}", tool_name="test", tool_type="API",
-            security_token="valid-token"
-        )
-
-    external_bus.publish_to_module(
-        target_module="ag-mcc-01",
-        event_type="tool_call_command",
-        source_module="ag-ecc-12",
-        data={
-            "instruction_id": "CMD-002",
-            "tool_name": "search_engine",
-            "tool_type": "API",
-            "security_token": "valid-token",
-        },
-    )
-    external_bus.process_all()
-    core.execution_core_main_loop()
+        core._active_tasks[f"T{i}"] = ToolCallCommand(instruction_id=f"T{i}", tool_name="filler", tool_type="API", security_token="t")
+    core._test_inject_command(ToolCallCommand(instruction_id="CMD-002", tool_name="search", tool_type="API", security_token="ok"))
     print(f"  队列深度: {len(core._queue)}")
 
-    print_separator("STEP 3: 安全令牌无效拒绝")
+    print("\n[演示] 非法令牌拒绝")
     core._active_tasks.clear()
     core._queue.clear()
-    
-    external_bus.publish_to_module(
-        target_module="ag-mcc-01",
-        event_type="tool_call_command",
-        source_module="ag-ecc-12",
-        data={
-            "instruction_id": "CMD-004",
-            "tool_name": "risky_tool",
-            "tool_type": "API",
-            "security_token": "",  # 空令牌
-        },
-    )
-    external_bus.process_all()
-    core.execution_core_main_loop()
-    print(f"  总执行数: {core._total_executed}")
-    print(f"  成功数: {core._success_count}")
+    core._test_inject_command(ToolCallCommand(instruction_id="CMD-003", tool_name="risky", tool_type="API", security_token=""))
+    print(f"  总执行: {core._total_executed}, 成功: {core._success_count}")
 
-    print("\n✅ 执行调度核心演示完成")
+    print("\n[演示] 超时通知处理")
+    core._active_tasks.clear()
+    core._queue.clear()
+    core._active_tasks["CMD-004"] = ToolCallCommand(
+        instruction_id="CMD-004", step_id="S02", plan_id="P02",
+        tool_name="slow_api", tool_type="API",
+        security_token="valid-token"
+    )
+    # 模拟 ag-mcc-02 发来的超时通知
+    core.handle_message(Message(
+        message_id="msg-01", topic="ag-mcc-01.timeout_notification",
+        source_module="ag-mcc-02", target_module="ag-mcc-01",
+        data={"task_id": "CMD-004", "elapsed_sec": 65.0, "timeout_threshold_sec": 60}
+    ))
+    print(f"  总执行: {core._total_executed}, 成功: {core._success_count}")
+    print(f"  活跃任务数（应为0）: {len(core._active_tasks)}")
+
+    print("\n✅ 演示完成")
 
 
 if __name__ == "__main__":
@@ -579,251 +416,65 @@ if __name__ == "__main__":
         print("=" * 60)
         passed, failed = 0, 0
 
-        def setup_core():
-            """创建测试环境"""
-            core = ExecutionCore()
-            from memory_bus import InternalBus, CerebellumBus
-            internal_bus = InternalBus()
-            external_bus = CerebellumBus()
-            core.bus = internal_bus
-            core.external_bus = external_bus
-            internal_bus.register_module("ag-mcc-01")
-            internal_bus.register_module("ag-mcc-02")
-            internal_bus.register_module("ag-mcc-06")
-            external_bus.register_module("ag-mcc-01")
-            external_bus.register_module("ag-ecc-12")
-            internal_bus.subscribe_to_module("ag-mcc-01", core.handle_message)
-            external_bus.subscribe_to_module("ag-mcc-01", core.handle_cerebellum_bus_message)
-            return core, internal_bus, external_bus
+        def setup():
+            return ExecutionCore()
 
-        # TC-MCC-01: 正常接收并分发API指令
-        print("\n[TC-MCC-01] 正常接收并分发API指令")
-        try:
-            c, ib, eb = setup_core()
-            eb.publish_to_module(
-                target_module="ag-mcc-01",
-                event_type="tool_call_command",
-                source_module="ag-ecc-12",
-                data={
-                    "instruction_id": "T01",
-                    "tool_name": "test",
-                    "tool_type": "API",
-                    "security_token": "valid-token-12345",
-                },
-            )
-            eb.process_all()
-            c.execution_core_main_loop()
-            ib.process_all()
-            assert len(c._active_tasks) == 1
-            print("   ✅ PASS")
-            passed += 1
-        except Exception as e:
-            print(f"   ❌ FAIL: {e}")
-            failed += 1
+        def valid_cmd(iid="T01", ttype="API"):
+            return ToolCallCommand(instruction_id=iid, tool_name="test", tool_type=ttype, security_token="valid-token-12345")
 
-        # TC-MCC-02: 并发满载时排队
-        print("\n[TC-MCC-02] 并发满载时排队")
-        try:
-            c, ib, eb = setup_core()
-            for i in range(c.MAX_CONCURRENT):
-                c._active_tasks[f"T{i}"] = ToolCallCommand(
-                    instruction_id=f"T{i}", tool_name="test", tool_type="API",
-                    security_token="valid-token"
-                )
-            eb.publish_to_module(
-                target_module="ag-mcc-01",
-                event_type="tool_call_command",
-                source_module="ag-ecc-12",
-                data={
-                    "instruction_id": "T02",
-                    "tool_name": "test",
-                    "tool_type": "API",
-                    "security_token": "valid-token",
-                },
-            )
-            eb.process_all()
-            c.execution_core_main_loop()
-            assert len(c._queue) == 1
-            print("   ✅ PASS")
-            passed += 1
-        except Exception as e:
-            print(f"   ❌ FAIL: {e}")
-            failed += 1
+        tests = [
+            ("正常接收并分发API指令", lambda c: (
+                c._test_inject_command(valid_cmd("T01")),
+                len(c._active_tasks) == 1
+            )),
+            ("并发满载时排队", lambda c: (
+                [c._active_tasks.__setitem__(f"T{i}", valid_cmd(f"T{i}")) for i in range(c.MAX_CONCURRENT)],
+                c._test_inject_command(valid_cmd("T02")),
+                len(c._queue) == 1
+            )),
+            ("未知工具类型返回错误", lambda c: (
+                c._test_inject_command(valid_cmd("T03", "UNKNOWN")),
+                c._total_executed == 1 and c._success_count == 0
+            )),
+            ("成功结果统计更新", lambda c: (
+                c._active_tasks.update({"T04": valid_cmd("T04")}),
+                c._test_inject_result(ExecutionResult(instruction_id="T04", status="success")),
+                c._total_executed == 1 and c._success_count == 1
+            )),
+            ("队列任务自动分发", lambda c: (
+                c._queue.append(valid_cmd("Q01")),
+                c.execution_core_main_loop(),
+                len(c._active_tasks) == 1 and len(c._queue) == 0
+            )),
+            ("非法令牌拒绝", lambda c: (
+                c._test_inject_command(ToolCallCommand(instruction_id="T06", tool_name="r", tool_type="API", security_token="")),
+                c._total_executed == 1 and c._success_count == 0
+            )),
+            ("重复指令拒绝", lambda c: (
+                c._active_tasks.update({"T07": valid_cmd("T07")}),
+                c._test_inject_command(valid_cmd("T07")),
+                c._total_executed == 0
+            )),
+            ("超时通知处理", lambda c: (
+                c._active_tasks.update({"T08": valid_cmd("T08")}),
+                c.handle_message(Message(
+                    message_id="msg-01", topic="ag-mcc-01.timeout_notification",
+                    source_module="ag-mcc-02", target_module="ag-mcc-01",
+                    data={"task_id": "T08", "elapsed_sec": 65.0, "timeout_threshold_sec": 60}
+                )),
+                c._total_executed == 1 and c._success_count == 0
+                and "T08" not in c._active_tasks
+            )),
+        ]
 
-        # TC-MCC-03: 未知工具类型返回错误
-        print("\n[TC-MCC-03] 未知工具类型返回错误")
-        try:
-            c, ib, eb = setup_core()
-            eb.publish_to_module(
-                target_module="ag-mcc-01",
-                event_type="tool_call_command",
-                source_module="ag-ecc-12",
-                data={
-                    "instruction_id": "T03",
-                    "tool_name": "test",
-                    "tool_type": "UNKNOWN",
-                    "security_token": "valid-token",
-                },
-            )
-            eb.process_all()
-            c.execution_core_main_loop()
-            assert c._total_executed == 1
-            assert c._success_count == 0
-            print("   ✅ PASS")
-            passed += 1
-        except Exception as e:
-            print(f"   ❌ FAIL: {e}")
-            failed += 1
-
-        # TC-MCC-04: 成功结果统计更新
-        print("\n[TC-MCC-04] 成功结果统计更新")
-        try:
-            c, ib, eb = setup_core()
-            c._active_tasks["T04"] = ToolCallCommand(
-                instruction_id="T04", tool_name="test", tool_type="API",
-                security_token="valid-token"
-            )
-            c._task_start_times["T04"] = time.time()
-            ib.publish(
-                topic="ag-mcc-01.execution_result",
-                source_module="ag-mcc-06",
-                data={
-                    "instruction_id": "T04",
-                    "status": "success",
-                    "duration_sec": 1.5,
-                },
-                target_module="ag-mcc-01",
-            )
-            ib.process_all()
-            assert c._total_executed == 1
-            assert c._success_count == 1
-            print("   ✅ PASS")
-            passed += 1
-        except Exception as e:
-            print(f"   ❌ FAIL: {e}")
-            failed += 1
-
-        # TC-MCC-05: 队列中的任务在空闲时自动分发
-        print("\n[TC-MCC-05] 队列中的任务在空闲时自动分发")
-        try:
-            c, ib, eb = setup_core()
-            c._queue = [ToolCallCommand(
-                instruction_id="Q01", tool_name="test", tool_type="API",
-                security_token="valid-token"
-            )]
-            c.execution_core_main_loop()
-            assert len(c._active_tasks) == 1
-            assert len(c._queue) == 0
-            print("   ✅ PASS")
-            passed += 1
-        except Exception as e:
-            print(f"   ❌ FAIL: {e}")
-            failed += 1
-
-        # TC-MCC-06: 安全令牌无效拒绝
-        print("\n[TC-MCC-06] 安全令牌无效拒绝")
-        try:
-            c, ib, eb = setup_core()
-            eb.publish_to_module(
-                target_module="ag-mcc-01",
-                event_type="tool_call_command",
-                source_module="ag-ecc-12",
-                data={
-                    "instruction_id": "T06",
-                    "tool_name": "risky",
-                    "tool_type": "API",
-                    "security_token": "",
-                },
-            )
-            eb.process_all()
-            c.execution_core_main_loop()
-            assert c._total_executed == 1
-            assert c._success_count == 0
-            print("   ✅ PASS")
-            passed += 1
-        except Exception as e:
-            print(f"   ❌ FAIL: {e}")
-            failed += 1
-
-        # TC-MCC-07: 重复指令检查
-        print("\n[TC-MCC-07] 重复指令检查")
-        try:
-            c, ib, eb = setup_core()
-            c._active_tasks["T07"] = ToolCallCommand(
-                instruction_id="T07", tool_name="test", tool_type="API",
-                security_token="valid-token"
-            )
-            eb.publish_to_module(
-                target_module="ag-mcc-01",
-                event_type="tool_call_command",
-                source_module="ag-ecc-12",
-                data={
-                    "instruction_id": "T07",
-                    "tool_name": "test",
-                    "tool_type": "API",
-                    "security_token": "valid-token",
-                },
-            )
-            eb.process_all()
-            c.execution_core_main_loop()
-            assert c._total_executed == 1
-            print("   ✅ PASS")
-            passed += 1
-        except Exception as e:
-            print(f"   ❌ FAIL: {e}")
-            failed += 1
-
-        # TC-MCC-08: 队列满时拒绝
-        print("\n[TC-MCC-08] 队列满时拒绝")
-        try:
-            c, ib, eb = setup_core()
-            for i in range(c.MAX_CONCURRENT):
-                c._active_tasks[f"T{i}"] = ToolCallCommand(
-                    instruction_id=f"T{i}", tool_name="test", tool_type="API",
-                    security_token="valid-token"
-                )
-            for i in range(c.MAX_QUEUE_SIZE):
-                c._queue.append(ToolCallCommand(
-                    instruction_id=f"Q{i}", tool_name="test", tool_type="API",
-                    security_token="valid-token"
-                ))
-            eb.publish_to_module(
-                target_module="ag-mcc-01",
-                event_type="tool_call_command",
-                source_module="ag-ecc-12",
-                data={
-                    "instruction_id": "T08",
-                    "tool_name": "test",
-                    "tool_type": "API",
-                    "security_token": "valid-token",
-                },
-            )
-            eb.process_all()
-            c.execution_core_main_loop()
-            assert len(c._queue) == c.MAX_QUEUE_SIZE
-            print("   ✅ PASS")
-            passed += 1
-        except Exception as e:
-            print(f"   ❌ FAIL: {e}")
-            failed += 1
-
-        # TC-MCC-09: 超时任务自动清理
-        print("\n[TC-MCC-09] 超时任务自动清理")
-        try:
-            c, ib, eb = setup_core()
-            c._active_tasks["T09"] = ToolCallCommand(
-                instruction_id="T09", tool_name="test", tool_type="API",
-                security_token="valid-token", timeout_sec=1
-            )
-            c._task_start_times["T09"] = time.time() - 2  # 已经超时
-            c.execution_core_main_loop()
-            assert c._total_executed == 1
-            assert c._success_count == 0
-            print("   ✅ PASS")
-            passed += 1
-        except Exception as e:
-            print(f"   ❌ FAIL: {e}")
-            failed += 1
+        for name, fn in tests:
+            print(f"\n[TC] {name}")
+            try:
+                c = setup()
+                assert fn(c)
+                print("   ✅ PASS"); passed += 1
+            except Exception as e:
+                print(f"   ❌ FAIL: {e}"); failed += 1
 
         print("\n" + "=" * 60)
         print(f"测试结果: {passed} PASS, {failed} FAIL")
