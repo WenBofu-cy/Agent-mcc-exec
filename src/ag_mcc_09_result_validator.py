@@ -606,7 +606,7 @@ def demo_main():
     bus.process_all()
     validator.result_validator_main_loop()
 
-    # 用例3：包含攻击载荷（触发安全告警）
+    # 用例3：包含攻击载荷（触发安全告警）【已修正参数顺序】
     print("\n[用例3] 检测SQL注入攻击载荷，触发高等级告警")
     bus.publish_to_module("ag-mcc-09", "validation_request", "ag-mcc-01", {
         "instruction_id": "VLD-003",
